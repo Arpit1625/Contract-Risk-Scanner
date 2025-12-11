@@ -1,1 +1,6 @@
 streamlit
+google-cloud-storage
+google-cloud-documentai
+google-cloud-aiplatform
+vertexai
+PyPDF2
