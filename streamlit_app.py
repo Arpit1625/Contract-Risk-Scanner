@@ -1,183 +1,242 @@
+# streamlit_app.py
 import streamlit as st
 import os
 import json
 import time
-from google.cloud import storage, documentai_v1 as documentai
+import re
+from tempfile import NamedTemporaryFile
+
+# Google auth & clients
+from google.oauth2 import service_account
+from google.cloud import storage
+from google.cloud import documentai_v1 as documentai
+
+# Vertex / Gemini
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
-# =========================
-# STREAMLIT UI SETUP
-# =========================
+# -------------------------
+# Page config
+# -------------------------
 st.set_page_config(page_title="Contract Risk Scanner", layout="wide")
 st.title("📜 Legal Contract Risk Scanner")
-st.caption("Analyzes contracts using Document AI + Gemini and returns clause-level JSON with actionable recommendations.")
+st.caption("Document AI → Gemini pipeline. Produces clause-level JSON with actionable recommendations.")
 
-st.sidebar.title("⚙️ Settings")
-PROJECT_ID = "contract-risk-scanner"
-LOCATION = "us"
-VERTEX_LOCATION = "us-central1"
-BUCKET_NAME = "contract-risk-scanner-bucket-7119"
-PROCESSOR_ID = "e2f1e97f3572e66"
+# -------------------------
+# App config (edit if needed)
+# -------------------------
+APP_CONFIG = st.secrets.get("app", {})  # optional config block in secrets
+PROJECT_ID = APP_CONFIG.get("project_id", "contract-risk-scanner")
+LOCATION = APP_CONFIG.get("location", "us")                      # Document AI region
+VERTEX_LOCATION = APP_CONFIG.get("vertex_location", "us-central1")
+BUCKET_NAME = APP_CONFIG.get("bucket_name", "contract-risk-scanner-bucket-7119")
+PROCESSOR_ID = APP_CONFIG.get("processor_id", "e2f1e97f3572e66")
 
-# =========================
-# STEP 1 — AUTHENTICATION (upload once)
-# =========================
-st.sidebar.header("🔐 Google Cloud Auth (upload once)")
+# -------------------------
+# Load credentials from Streamlit secrets
+# -------------------------
+if "google_service_account" not in st.secrets:
+    st.error(
+        "Google service account not found in Streamlit secrets.\n\n"
+        "Add the full service account JSON to Streamlit secrets under the key: 'google_service_account'."
+    )
+    st.stop()
 
-if "auth_configured" not in st.session_state:
-    st.session_state["auth_configured"] = False
+service_account_info = st.secrets["google_service_account"]
 
-if not st.session_state["auth_configured"]:
-    uploaded_key = st.sidebar.file_uploader("Upload your key.json (only once)", type=["json"])
-    if uploaded_key:
-        key_path = "gcp_key.json"
-        with open(key_path, "wb") as f:
-            f.write(uploaded_key.getbuffer())
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
-        st.session_state["auth_configured"] = True
-        st.sidebar.success("✅ Google Cloud Authenticated (saved as gcp_key.json)")
-else:
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "gcp_key.json"
-    st.sidebar.success("✅ Using saved credentials")
+try:
+    credentials = service_account.Credentials.from_service_account_info(service_account_info)
+except Exception as e:
+    st.error(f"Failed to construct credentials from secrets: {e}")
+    st.stop()
 
-# =========================
-# STEP 2 — PDF UPLOAD
-# =========================
-def upload_to_gcs(file, filename):
-    storage_client = storage.Client()
+# -------------------------
+# Initialize Google clients using credentials
+# -------------------------
+try:
+    storage_client = storage.Client(credentials=credentials, project=PROJECT_ID)
+    docai_client = documentai.DocumentProcessorServiceClient(credentials=credentials)
+except Exception as e:
+    st.error(f"Failed to initialize Google clients: {e}")
+    st.stop()
+
+# -------------------------
+# Helper: sanitize and parse model output to JSON
+# -------------------------
+def sanitize_and_parse(analysis_raw: str):
+    """Try parse JSON; attempt simple fixes if model output is malformed."""
+    # direct parse
+    try:
+        return json.loads(analysis_raw)
+    except Exception:
+        pass
+
+    text = analysis_raw.strip()
+
+    # remove common numeric labels like 0:{ inside arrays
+    text = re.sub(r'(\[)\s*\d+\s*:', r'\1', text)
+    text = re.sub(r',\s*\d+\s*:', ',', text)
+    text = re.sub(r'\{\s*\d+\s*:', '{', text)
+
+    # convert single quotes to double quotes only if it looks like JSON with single quotes
+    if "'" in text and '"' not in text[:200]:
+        text = text.replace("'", '"')
+
+    # extract first JSON object or array candidate
+    start_obj = text.find('{')
+    end_obj = text.rfind('}')
+    start_arr = text.find('[')
+    end_arr = text.rfind(']')
+
+    candidate = None
+    if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+        candidate = text[start_obj:end_obj+1]
+    elif start_arr != -1 and end_arr != -1 and end_arr > start_arr:
+        candidate = text[start_arr:end_arr+1]
+
+    if candidate:
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+    return None
+
+# Upload helper
+def upload_to_gcs_fileobj(file_obj, filename):
     bucket = storage_client.bucket(BUCKET_NAME)
-    timestamp = int(time.time())
-    blob_name = f"contracts/{timestamp}_{filename}"
+    ts = int(time.time())
+    safe_name = filename.replace(" ", "_")
+    blob_name = f"contracts/{ts}_{safe_name}"
     blob = bucket.blob(blob_name)
-    file.seek(0)
-    blob.upload_from_file(file)
-    return f"gs://{BUCKET_NAME}/{blob_name}"
-
+    file_obj.seek(0)
+    blob.upload_from_file(file_obj)
+    return f"gs://{BUCKET_NAME}/{blob_name}", blob_name
+# UI: file uploader
+st.header("Upload contract PDF")
 uploaded_pdf = st.file_uploader("📂 Upload Your Contract (PDF)", type=["pdf"])
 
-if not uploaded_pdf:
-    st.info("Upload a contract PDF to start.")
+if uploaded_pdf is None:
+    st.info("Upload a PDF for analysis.")
     st.stop()
 
 # Upload to GCS
-st.info("⏳ Uploading contract to Google Cloud Storage...")
-gcs_path = upload_to_gcs(uploaded_pdf, uploaded_pdf.name)
-st.success(f"✅ Uploaded to: {gcs_path}")
-
-# =========================
-# STEP 3 — DOCUMENT AI: extract text (not shown)
-# =========================
-st.info("🔍 Extracting text from contract using Document AI...")
-docai_client = documentai.DocumentProcessorServiceClient()
+with st.spinner("⏳ Uploading contract to Google Cloud Storage..."):
+    try:
+        gcs_uri, blob_name = upload_to_gcs_fileobj(uploaded_pdf, uploaded_pdf.name)
+        st.success("✅ File Uploaded")
+    except Exception as e:
+        st.error(f"Upload failed: {e}")
+        st.stop()
+# Document AI: extract text (direct)
+st.info("🔍 Extracting text from contract...")
 processor_name = f"projects/{PROJECT_ID}/locations/{LOCATION}/processors/{PROCESSOR_ID}"
 
-storage_client = storage.Client()
-bucket = storage_client.bucket(BUCKET_NAME)
-# blob_name is everything after gs://<bucket>/
-blob_name = gcs_path.replace(f"gs://{BUCKET_NAME}/", "")
-blob = bucket.blob(blob_name)
-pdf_bytes = blob.download_as_bytes()
+try:
+    # download the uploaded object bytes back (or use uploaded_pdf.getvalue())
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(blob_name)
+    pdf_bytes = blob.download_as_bytes()
 
-raw_document = documentai.RawDocument(content=pdf_bytes, mime_type="application/pdf")
-request = documentai.ProcessRequest(name=processor_name, raw_document=raw_document)
-result = docai_client.process_document(request)
+    raw_document = documentai.RawDocument(content=pdf_bytes, mime_type="application/pdf")
+    request = documentai.ProcessRequest(name=processor_name, raw_document=raw_document)
+    result = docai_client.process_document(request)
 
-if not (result.document and result.document.text):
-    st.error("❌ Could not extract text from the document. Try a different file or processor.")
+    if not (result and getattr(result, "document", None)):
+        st.error("Document AI returned no document object.")
+        st.stop()
+
+    extracted_text = (result.document.text or "").strip()
+    if not extracted_text:
+        st.error("Document AI extracted no text. Try another file or configure a different processor.")
+        st.stop()
+
+    # write extracted text to a file for optional download (not displayed)
+    with open("extracted_contract_text.txt", "w", encoding="utf-8") as f:
+        f.write(extracted_text)
+
+    st.success("🎯 Text extraction completed successfully. Ready for risk analysis phase.")
+    st.download_button("📥 Download Extracted Text (optional)", extracted_text, file_name="extracted_contract_text.txt")
+
+except Exception as e:
+    st.error(f"Document AI processing failed: {e}")
     st.stop()
-
-extracted_text = result.document.text.strip()
-# Save the extracted text for download (but DO NOT display)
-with open("extracted_contract_text.txt", "w", encoding="utf-8") as f:
-    f.write(extracted_text)
-st.success("🎯 Text extraction completed successfully. Ready for risk analysis phase.")
-st.download_button("📥 Download Extracted Text (optional)", extracted_text, file_name="extracted_contract_text.txt")
-
-# =========================
-# STEP 4 — GEMINI: risk analysis with actionable recommendations
-# =========================
+# Gemini (Vertex) analysis
+st.header("AI Risk Analysis")
 if st.button("🤖 Run Contract Risk Analysis"):
-    with st.spinner("Analyzing contract using Gemini 2.5 Flash Lite..."):
+    with st.spinner("Analyzing contract..."):
         try:
-            # Initialize Vertex AI
-            vertexai.init(project=PROJECT_ID, location=VERTEX_LOCATION)
+            # Vertex init: prefer passing credentials if supported, otherwise write temp key file
+            try:
+                vertexai.init(project=PROJECT_ID, location=VERTEX_LOCATION, credentials=credentials)
+            except TypeError:
+                # fallback: create a temp JSON key file and set env var (lives only in runtime)
+                tmpf = NamedTemporaryFile(delete=False, suffix=".json")
+                tmpf.write(json.dumps(service_account_info).encode("utf-8"))
+                tmpf.flush()
+                tmpf.close()
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = tmpf.name
+                vertexai.init(project=PROJECT_ID, location=VERTEX_LOCATION)
+
             model = GenerativeModel("gemini-2.5-flash-lite")
 
-            # Prompt: requires clause list + actionable_recommendations + overall summary
             prompt = f"""
-You are a legal contract analysis assistant. Analyze the contract text below and return a single VALID JSON object with two top-level keys:
+You are a legal contract analysis assistant. Analyze the contract text below and return a SINGLE VALID JSON OBJECT with two top-level keys:
 
-1) "clauses": a JSON array where each item is an object with these exact fields:
-   - clause_id: integer (sequential starting at 1)
-   - original_text: the exact clause text (short paragraph)
-   - simplified_text: one-line plain-English summary
-   - risk_category: one of ["Termination", "Compensation", "Confidentiality", "Liability", "Non-compete", "Data Sharing", "Jurisdiction", "Auto-Renewal", "Penalty Fees", "Unilateral Changes", "Other"]
-   - severity: one of ["High", "Medium", "Low"]
-   - why_it_matters: one-sentence explanation of legal significance
-   - actionable_recommendations: an array of 1-3 short, practical, prioritized next steps (e.g., "Negotiate clause X", "Seek counsel", "Request clarification", "Remove automatic renewal", "Limit penalty to X", etc.)
+1) "clauses": an array where each item is an object with these exact fields:
+   - clause_id (integer)
+   - original_text (string)
+   - simplified_text (string)
+   - risk_category (one of ["Termination","Compensation","Confidentiality","Liability","Non-compete","Data Sharing","Jurisdiction","Auto-Renewal","Penalty Fees","Unilateral Changes","Other"])
+   - severity (one of ["High","Medium","Low"])
+   - why_it_matters (string)
+   - actionable_recommendations (array of short strings, 1-3 items)
 
-2) "actionable_recommendations_summary": an array of 3-6 high-level, prioritized actions covering the entire contract (for negotiation and caution). Each item must be short and specific (max 20 words).
+2) "actionable_recommendations_summary": array of 3-6 short, prioritized actions for the entire contract.
 
 Important rules:
-- Respond ONLY with the JSON object (no preamble, no commentary).
-- Ensure valid JSON; do not include markdown or code fences.
-- Limit clause text to concise chunks (not full document). Produce up to 20 clauses if applicable.
+- Respond ONLY with a single valid JSON object. No commentary, no markdown, no numbered prefixes.
+- Limit the clause extraction to concise chunks, up to 20 clauses.
+- Keep each "simplified_text" to one sentence, and actionable recommendations to very short instructions.
 
 Contract text (first 5000 characters):
 {extracted_text[:5000]}
 """
-
             response = model.generate_content(prompt)
             analysis_raw = response.text.strip()
 
-            # Try to parse JSON. If model appended extra text, attempt to slice the JSON.
-            try:
-                analysis_obj = json.loads(analysis_raw)
-            except json.JSONDecodeError:
-                # try to extract JSON object between first '{' and last '}'
-                start = analysis_raw.find("{")
-                end = analysis_raw.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    try:
-                        analysis_obj = json.loads(analysis_raw[start:end+1])
-                    except Exception:
-                        analysis_obj = None
-                else:
-                    analysis_obj = None
+            # attempt to parse JSON; sanitize if necessary
+            analysis_obj = sanitize_and_parse(analysis_raw)
 
             if analysis_obj is None:
-                st.warning("⚠️ Gemini output was not valid JSON. Showing raw output and saving as text.")
+                st.warning("⚠️ Gemini output could not be parsed as JSON. Showing raw output and providing TXT download.")
                 st.text_area("Raw Gemini Output", analysis_raw, height=400)
-                # Save raw fallback
                 with open("contract_risk_analysis.txt", "w", encoding="utf-8") as f:
                     f.write(analysis_raw)
                 st.download_button("📥 Download Raw Analysis (TXT)", analysis_raw, file_name="contract_risk_analysis.txt")
             else:
-                # Pretty display and downloads
+                pretty_json = json.dumps(analysis_obj, indent=2, ensure_ascii=False)
+                with open("contract_risk_analysis.json", "w", encoding="utf-8") as f:
+                    f.write(pretty_json)
+
                 st.success("✅ Legal Risk Analysis Completed")
-                # Show JSON in an expandable viewer
                 st.subheader("📋 Clause-level Analysis (JSON)")
                 st.json(analysis_obj)
 
-                # Save JSON file
-                json_data = json.dumps(analysis_obj, indent=2, ensure_ascii=False)
-                with open("contract_risk_analysis.json", "w", encoding="utf-8") as f:
-                    f.write(json_data)
-
                 st.download_button(
                     label="📥 Download Risk Analysis (JSON)",
-                    data=json_data,
+                    data=pretty_json,
                     file_name="contract_risk_analysis.json",
                     mime="application/json"
                 )
 
-                # Additionally show the high-level actionable_recommendations_summary if present
+                # show high-level actionable summary if present
                 summary = analysis_obj.get("actionable_recommendations_summary")
-                if summary:
+                if isinstance(summary, list) and summary:
                     st.subheader("🧭 High-level Actionable Recommendations")
                     for i, item in enumerate(summary, start=1):
                         st.markdown(f"**{i}.** {item}")
 
         except Exception as e:
-            st.error(f"❌ AI Analysis failed: {e}")
+            st.error(f"AI analysis failed: {e}")
+            st.exception(e)
